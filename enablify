@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+
+from zlib import adler32
+from subprocess import run, DEVNULL, PIPE
+from sys import argv
+from os.path import exists
+from shutil import copyfile
+import tempfile
+
+MAGIC = b'Joy!peffpwpc'
+RFORK = '/..namedfork/rsrc'
+
+
+# def copyfile(a, b):
+#     run(['cp', a, b], check=True, stderr=DEVNULL)
+
+
+def _get_info_size(b):
+    a, b, c = b.partition(b'constant info-size')
+    a, b, c = a.rpartition(b'h#')
+    return int(c, 16)
+
+
+def _get_cfrg_resources(path, *args):
+    cfrg_derez = run(['DeRez', '-only', 'cfrg', *args, path], check=True, stdout=PIPE).stdout
+
+    line_groups = []
+    for l in cfrg_derez.split(b'\n'):
+        if not l: continue
+
+        if l.startswith(b'data'):
+            line_groups.append([l])
+        else:
+            line_groups[-1].append(l)
+
+    cfrg_tuples = [] # list of (firstline, lastline, binary)
+    for l in line_groups:
+        if not l[-1].startswith(b'}'): raise ValueError
+
+        accum = bytearray()
+        for dl in l:
+            if not dl.lstrip().startswith(b'$'): continue
+            _, _, h = dl.partition(b'$"')
+            h, _, _ = h.rpartition(b'"')
+            h = h.decode('ascii')
+            h = bytes.fromhex(h)
+            accum.extend(h)
+
+        cfrg_tuples.append((l[0], l[-1], accum))
+
+    return cfrg_tuples
+
+
+def _save_cfrg_resources(path, the_resources):
+    savestr = bytearray()
+
+    for firstline, lastline, data in the_resources:
+        savestr.extend(firstline)
+        savestr.extend(b'\n')
+        savestr.extend(b'$"' + data.hex().encode('ascii') + b'"\n')
+        # for b in data:
+        #     savestr.extend(('    $"%02x"\n' % b).encode('ascii'))
+        savestr.extend(lastline)
+        savestr.extend(b'\n')
+
+    # run(['cat'], check=True, input=savestr)
+    with tempfile.NamedTemporaryFile(mode='wb') as f:
+        f.write(savestr)
+        f.flush()
+        run(['Rez', '-a', '-o', path, f.name], check=True)
+
+
+# return (start, stop)
+def _get_code_fragment_range(b):
+    NASTY = b'\r\\ h#'
+    info_size = _get_info_size(b)
+    the_start = b.find(MAGIC, info_size)
+
+    the_end = len(b)
+    if NASTY in b[-100:]:
+        the_end = b.rfind(NASTY)
+
+    return the_start, the_end
+
+
+def _find_all(a_str, sub):
+    start = 0
+    while True:
+        start = a_str.find(sub, start)
+        if start == -1: return
+        yield start
+        start += len(sub) # use start += 1 to find overlapping matches
+
+
+def _replace_int32_in_bytearray(b, x, y):
+    x = x.to_bytes(length=4, byteorder='big', signed=False)
+    y = y.to_bytes(length=4, byteorder='big', signed=False)
+    b[:] = b.replace(x, y)
+
+
+def enablify(orig, dest):
+    with open(orig, 'rb') as f:
+        orig_df = f.read()
+    with open(dest, 'rb') as f:
+        dest_df = bytearray(f.read())
+
+    # trim dest data fork if it already has enabler-related junk at the end
+    dest_info_size = _get_info_size(dest_df)
+    if len(dest_df) > dest_info_size + 20:
+        cut_at = dest_df.find(MAGIC, dest_info_size)
+        del dest_df[cut_at:]
+
+    dest_needs_checksum = b'\r\\ h#' in dest_df[-20:]
+
+    old_offset, old_stop = _get_code_fragment_range(orig_df)
+
+    while len(dest_df) % 16:
+        dest_df.append(0)
+    new_offset = len(dest_df)
+
+    every_sub_offset = list(_find_all(orig_df[old_offset:old_stop], MAGIC))
+
+    the_resources = list(_get_cfrg_resources(orig))
+
+    for _, _, rsrc_data in the_resources:
+        for this_sub_offset in every_sub_offset:
+            # print('Replacing', hex(old_offset + this_sub_offset), 'with', hex(new_offset + this_sub_offset))
+            _replace_int32_in_bytearray(rsrc_data, old_offset + this_sub_offset, new_offset + this_sub_offset)
+
+    dest_df.extend(orig_df[old_offset:old_stop])
+
+    # re-checksum?
+    if dest_needs_checksum:
+        cksum = adler32(dest_df)
+        cksum_str = ('\r\\ h# %08X' % cksum).encode('ascii')
+        dest_df.extend(cksum_str)
+
+
+    with open(dest, 'wb') as f:
+        f.write(dest_df)
+
+    if exists(orig + '.r'):
+        # print('doing the rez thing')
+        run(['Rez', '-o', dest, orig + '.r'], check=True)
+    else:
+        copyfile(orig + RFORK, dest + RFORK)
+
+    _save_cfrg_resources(dest, the_resources)
+
+
+if __name__ == '__main__':
+    orig, dest = argv[1:]
+    enablify(orig, dest)
